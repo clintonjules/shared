@@ -1,72 +1,68 @@
-import os
-
-# Must be set before importing transformers/datasets so neither library
-# attempts any outbound call (model lookup, telemetry, etc.)
-os.environ["HF_HUB_OFFLINE"] = "1"
-os.environ["TRANSFORMERS_OFFLINE"] = "1"
-os.environ["HF_DATASETS_OFFLINE"] = "1"
-os.environ["WANDB_DISABLED"] = "true"
-
-import pandas as pd
 import torch
-from datasets import Dataset
-from transformers import (
-    AutoTokenizer,
-    AutoModelForCausalLM,
-    Trainer,
-    TrainingArguments,
-    DataCollatorForSeq2Seq,
-)
+from datasets import load_dataset, Dataset
+from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments
+from trl import SFTTrainer, SFTConfig
 
-# Local path to the already-downloaded model weights/tokenizer files
-# (a directory containing config.json, tokenizer files, *.safetensors, etc.)
-model_name = "/path/to/local/gemma-model"
-csv_path = "data.csv"
-max_length = 4096
+# Load your dataset (assume JSONL or CSV with columns: prompt/question, oss_response)
+# Example: dataset = load_dataset("json", data_files="your_data.jsonl")
 
-tokenizer = AutoTokenizer.from_pretrained(model_name, local_files_only=True)
-if tokenizer.pad_token is None:
-    tokenizer.pad_token = tokenizer.eos_token
+def format_example(example):
+    # Customize this to your format
+    prompt = example["prompt"] + "\n" + example["question"]
+    response = example["oss_response"]
+    # Use chat template if available, or simple format
+    return {
+        "text": f"<|user|>\n{prompt}<|assistant|>\n{response}"
+        # or for Llama-3 style: apply_chat_template
+    }
 
-df = pd.read_csv(csv_path).fillna("")
-df["prompt"] = df["system_prompt"].astype(str) + "\n\nUser: " + df["question"].astype(str) + "\n\nAssistant:"
-df["target"] = df["response"].astype(str)
+# Apply formatting
+dataset = your_dataset.map(format_example)
 
+model_name = "meta-llama/Llama-3.2-1B-Instruct"  # or your student (smaller Llama)
+teacher_responses = ...  # your OSS data
 
-def tokenize(row):
-    prompt_ids = tokenizer(row["prompt"], add_special_tokens=False)["input_ids"]
-    full = tokenizer(row["prompt"] + " " + row["target"], truncation=True, max_length=max_length)
-    labels = full["input_ids"].copy()
-    cut = min(len(prompt_ids), len(labels))
-    labels[:cut] = [-100] * cut
-    full["labels"] = labels
-    return full
-
-
-dataset = Dataset.from_pandas(df[["prompt", "target"]]).map(
-    tokenize, remove_columns=["prompt", "target"]
-)
-
+tokenizer = AutoTokenizer.from_pretrained(model_name)
 model = AutoModelForCausalLM.from_pretrained(
-    model_name, torch_dtype=torch.bfloat16, device_map="auto", local_files_only=True
+    model_name,
+    torch_dtype=torch.bfloat16,
+    device_map="auto",
+    attn_implementation="flash_attention_2",  # if supported
 )
 
-collator = DataCollatorForSeq2Seq(tokenizer, padding=True, label_pad_token_id=-100)
+# Optional: LoRA for efficiency
+from peft import LoraConfig, get_peft_model
+lora_config = LoraConfig(
+    r=16, lora_alpha=32, lora_dropout=0.05,
+    target_modules="all-linear",  # or ["q_proj", "v_proj", ...]
+    task_type="CAUSAL_LM"
+)
+model = get_peft_model(model, lora_config)
 
-args = TrainingArguments(
-    output_dir="gemma4-distilled",
-    per_device_train_batch_size=1,
-    num_train_epochs=1,
+training_args = TrainingArguments(
+    output_dir="./llama_distilled",
+    per_device_train_batch_size=4,  # adjust to your GPU
+    gradient_accumulation_steps=4,
     learning_rate=2e-5,
-    warmup_ratio=0.1,
-    logging_steps=20,
+    num_train_epochs=2,
+    fp16=False,
     bf16=True,
+    logging_steps=10,
     save_strategy="epoch",
-    report_to="none",  # no wandb/mlflow/tensorboard-hub callbacks, no external transmission
+    optim="adamw_torch",
+    report_to="none",  # or "wandb"
 )
 
-trainer = Trainer(model=model, args=args, train_dataset=dataset, data_collator=collator)
-trainer.train()
+trainer = SFTTrainer(
+    model=model,
+    tokenizer=tokenizer,
+    train_dataset=dataset,
+    args=SFTConfig(  # or TrainingArguments
+        max_seq_length=2048,
+        packing=True,  # efficient for multiple short examples
+        dataset_text_field="text",
+    ),
+)
 
-trainer.save_model("gemma4-distilled")
-tokenizer.save_pretrained("gemma4-distilled")
+trainer.train()
+trainer.save_model("./llama_distilled_final")
